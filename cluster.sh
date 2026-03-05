@@ -1,29 +1,25 @@
 #!/bin/bash
 
 # =============================================================================
-# Kubernetes Cluster Deployment Script with Fedora CoreOS
+# Kubernetes Cluster Deployment Script - Multi-Cluster Edition
 # =============================================================================
-# This script creates a Kubernetes cluster using Fedora CoreOS VMs via libvirt
-# Topology: 2 networks × 3 VMs (control plane + worker combined) = 6 VMs total
+# Deploys 2 independent Kubernetes clusters in parallel
+# Each cluster: 3 VMs (control plane + worker) on separate networks
 # =============================================================================
 
 set -euo pipefail
 
 # =============================================================================
-# CONFIGURATION VARIABLES - Modify these to customize your deployment
+# CONFIGURATION VARIABLES
 # =============================================================================
 
-# Script metadata
 SCRIPT_NAME=$(basename "$0")
 USER="uni"
 
 # Paths
-STATE_LOCK_FILE="/var/lib/libvirt/conf/k8s-cluster-state.lock"
-KUBESPRAY_DIR="/home/$USER/fcos/kubespray"
-INVENTORY_DIR="${KUBESPRAY_DIR}/inventory/mycluster"
-INVENTORY_FILE="${INVENTORY_DIR}/inventory.ini"
 LIBVIRT_IMAGES_DIR="/var/lib/libvirt/images"
 CONF_DIR="/var/lib/libvirt/conf"
+KUBESPRAY_DIR="/home/$USER/fcos/kubespray"
 
 # Fedora CoreOS Image
 FCOS_IMAGE_NAME="fedora-coreos-43.20260217.3.1-qemu.x86_64.qcow2"
@@ -41,33 +37,66 @@ NETWORK_1_DNS="1.1.1.1"
 NETWORK_2_DNS="1.1.1.1"
 NETWORK_INTERFACE="enp1s0"
 
-# VM Configuration
-VMS_PER_NETWORK=3
-VM_RAM_MB=10240          # 10GB RAM
-VM_VCPUS=8               # 8 vCPUs
-VM_MAIN_DISK_GB=50       # Main disk for FCOS
-VM_EXTRA_DISK_GB=100     # Additional disk for storage
-VM_NAME_PREFIX="k8s-node"
+# Cluster 1 Configuration
+CLUSTER_1_NAME="cluster-1"
+CLUSTER_1_PREFIX="k8s-c1"
+CLUSTER_1_STATE="${CONF_DIR}/k8s-cluster-1-state.lock"
+CLUSTER_1_INVENTORY_DIR="${KUBESPRAY_DIR}/inventory/${CLUSTER_1_NAME}"
+CLUSTER_1_INVENTORY="${CLUSTER_1_INVENTORY_DIR}/inventory.ini"
+CLUSTER_1_NETWORK="${NETWORK_1_NAME}"
+CLUSTER_1_GATEWAY="${NETWORK_1_GATEWAY}"
+CLUSTER_1_DNS="${NETWORK_1_DNS}"
+CLUSTER_1_IP_BASE="10.235.1"
 
-# IP Configuration
-NETWORK_1_IP_BASE="10.235.1"
-NETWORK_2_IP_BASE="10.235.2"
-IP_START=11              # First VM will get .11
+# Cluster 2 Configuration
+CLUSTER_2_NAME="cluster-2"
+CLUSTER_2_PREFIX="k8s-c2"
+CLUSTER_2_STATE="${CONF_DIR}/k8s-cluster-2-state.lock"
+CLUSTER_2_INVENTORY_DIR="${KUBESPRAY_DIR}/inventory/${CLUSTER_2_NAME}"
+CLUSTER_2_INVENTORY="${CLUSTER_2_INVENTORY_DIR}/inventory.ini"
+CLUSTER_2_NETWORK="${NETWORK_2_NAME}"
+CLUSTER_2_GATEWAY="${NETWORK_2_GATEWAY}"
+CLUSTER_2_DNS="${NETWORK_2_DNS}"
+CLUSTER_2_IP_BASE="10.235.2"
+
+# VM Configuration
+VMS_PER_CLUSTER=3
+VM_RAM_MB=10240
+VM_VCPUS=8
+VM_MAIN_DISK_GB=50
+VM_EXTRA_DISK_GB=100
+IP_START=11
 
 # SSH Configuration
 SSH_USER="ansibleUser"
 SSH_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIRVkwktzS1+6dWwKRanRGU+ANjtgR5WIRu9e5sNCqgP"
 SSH_PRIVATE_KEY="${HOME}/.ssh/id_rsa"
 
+# Target cluster (empty = all, 1 = cluster-1, 2 = cluster-2)
+TARGET_CLUSTER=""
+
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
 
 usage() {
-    echo "Usage: $SCRIPT_NAME {create|delete|deploy}"
-    echo "  create - Create Kubernetes cluster VMs and networks"
-    echo "  delete - Delete all VMs and networks created by this script"
-    echo "  deploy - Deploy Kubernetes using Kubespray"
+    echo "Usage: $SCRIPT_NAME {create|delete|deploy} [--cluster 1|2]"
+    echo ""
+    echo "Commands:"
+    echo "  create  - Create Kubernetes cluster VMs and networks"
+    echo "  delete  - Delete all VMs and networks created by this script"
+    echo "  deploy  - Deploy Kubernetes using Kubespray"
+    echo ""
+    echo "Options:"
+    echo "  --cluster 1|2  - Target only cluster 1 or 2 (default: both)"
+    echo ""
+    echo "Examples:"
+    echo "  $SCRIPT_NAME create              # Create both clusters"
+    echo "  $SCRIPT_NAME create --cluster 1  # Create only cluster 1"
+    echo "  $SCRIPT_NAME deploy              # Deploy both clusters"
+    echo "  $SCRIPT_NAME deploy --cluster 2  # Deploy only cluster 2"
+    echo "  $SCRIPT_NAME delete              # Delete both clusters"
+    echo "  $SCRIPT_NAME delete --cluster 1  # Delete only cluster 1"
     exit 1
 }
 
@@ -87,7 +116,39 @@ log_warn() {
     echo "[!] $1"
 }
 
-# Function to wait for SSH connectivity
+log_cluster() {
+    local cluster=$1
+    local message=$2
+    echo "[CLUSTER-$cluster] $message"
+}
+
+parse_args() {
+    if [ $# -eq 0 ]; then
+        usage
+    fi
+    
+    MODE=$1
+    shift
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --cluster)
+                if [ -n "${2:-}" ] && [[ "$2" =~ ^[12]$ ]]; then
+                    TARGET_CLUSTER="$2"
+                    shift 2
+                else
+                    log_error "--cluster requires argument 1 or 2"
+                    exit 1
+                fi
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                usage
+                ;;
+        esac
+    done
+}
+
 wait_for_ssh() {
     local ip=$1
     local max_attempts=60
@@ -97,28 +158,24 @@ wait_for_ssh() {
     
     while [ $attempt -lt $max_attempts ]; do
         if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes ${SSH_USER}@${ip} "echo SSH ready" &> /dev/null; then
-            log_success "SSH connection successful to ${ip}"
             return 0
         fi
         attempt=$((attempt + 1))
         sleep 5
     done
     
-    log_error "Failed to establish SSH connection to ${ip} after ${max_attempts} attempts"
     return 1
 }
 
 # =============================================================================
-# DEPENDENCIES INSTALLATION
+# DEPENDENCIES
 # =============================================================================
 
 install_dependencies() {
     log_info "Checking and installing dependencies..."
     
-    # Update package list
     sudo apt-get update
     
-    # Install required packages
     local packages="git libvirt-daemon libvirt-clients sudo podman virt-install qemu-utils"
     
     for pkg in $packages; do
@@ -130,56 +187,39 @@ install_dependencies() {
         fi
     done
     
-    # Enable and start libvirtd service
-    log_info "Enabling libvirtd service..."
     sudo systemctl enable libvirtd
     sudo systemctl start libvirtd
     
     log_success "All dependencies installed"
 }
 
-# =============================================================================
-# APPARMOR FIX
-# =============================================================================
-
 fix_apparmor() {
     log_info "Applying AppArmor fix for libvirt..."
     
     local apparmor_file="/etc/apparmor.d/abstractions/libvirt-qemu"
     
-    # Check if AppArmor is enabled
     if ! command -v aa-status &> /dev/null; then
         log_warn "AppArmor not found, skipping fix"
         return 0
     fi
     
-    # Check if the rules already exist
     if grep -q "/var/lib/libvirt/conf/" "$apparmor_file" 2>/dev/null; then
         log_info "AppArmor rules already applied"
         return 0
     fi
     
-    # Add AppArmor rules to allow access to conf directory
     log_info "Adding AppArmor rules for /var/lib/libvirt/conf/"
-    
-    # Backup original file
     sudo cp "$apparmor_file" "${apparmor_file}.backup.$(date +%Y%m%d%H%M%S)"
     
-    # Add rules at the end of the file (before the closing brace if present)
     if grep -q "^}$" "$apparmor_file"; then
-        # File ends with }, insert before the closing brace
         sudo sed -i '/^}$/i\  /var/lib/libvirt/conf/ r,\n  /var/lib/libvirt/conf/** r,' "$apparmor_file"
     else
-        # Append to file
         echo "  /var/lib/libvirt/conf/ r," | sudo tee -a "$apparmor_file" > /dev/null
         echo "  /var/lib/libvirt/conf/** r," | sudo tee -a "$apparmor_file" > /dev/null
     fi
     
-    # Reload AppArmor profile
-    log_info "Reloading AppArmor profile..."
     sudo apparmor_parser -r "$apparmor_file" || {
         log_error "Failed to reload AppArmor profile"
-        log_info "Restoring backup..."
         sudo cp "${apparmor_file}.backup."* "$apparmor_file"
         return 1
     }
@@ -212,34 +252,36 @@ EOF
 
 create_networks() {
     log_info "Creating libvirt networks..."
-    
-    # Ensure conf directory exists
     sudo mkdir -p "${CONF_DIR}"
     
     # Network 1
-    if sudo virsh net-list --all | grep -q "${NETWORK_1_NAME}"; then
-        log_warn "Network ${NETWORK_1_NAME} already exists, skipping creation"
-    else
-        log_info "Creating network ${NETWORK_1_NAME} (${NETWORK_1_CIDR})"
-        local net1_xml="${CONF_DIR}/${NETWORK_1_NAME}.xml"
-        create_network_xml "${NETWORK_1_NAME}" "${NETWORK_1_GATEWAY}" | sudo tee "${net1_xml}" > /dev/null
-        sudo virsh net-define "${net1_xml}"
-        sudo virsh net-autostart "${NETWORK_1_NAME}"
-        sudo virsh net-start "${NETWORK_1_NAME}"
-        log_success "Network ${NETWORK_1_NAME} created and started"
+    if [ -z "$TARGET_CLUSTER" ] || [ "$TARGET_CLUSTER" == "1" ]; then
+        if sudo virsh net-list --all | grep -q "${NETWORK_1_NAME}"; then
+            log_warn "Network ${NETWORK_1_NAME} already exists, skipping creation"
+        else
+            log_info "Creating network ${NETWORK_1_NAME} (${NETWORK_1_CIDR})"
+            local net1_xml="${CONF_DIR}/${NETWORK_1_NAME}.xml"
+            create_network_xml "${NETWORK_1_NAME}" "${NETWORK_1_GATEWAY}" | sudo tee "${net1_xml}" > /dev/null
+            sudo virsh net-define "${net1_xml}"
+            sudo virsh net-autostart "${NETWORK_1_NAME}"
+            sudo virsh net-start "${NETWORK_1_NAME}"
+            log_success "Network ${NETWORK_1_NAME} created and started"
+        fi
     fi
     
     # Network 2
-    if sudo virsh net-list --all | grep -q "${NETWORK_2_NAME}"; then
-        log_warn "Network ${NETWORK_2_NAME} already exists, skipping creation"
-    else
-        log_info "Creating network ${NETWORK_2_NAME} (${NETWORK_2_CIDR})"
-        local net2_xml="${CONF_DIR}/${NETWORK_2_NAME}.xml"
-        create_network_xml "${NETWORK_2_NAME}" "${NETWORK_2_GATEWAY}" | sudo tee "${net2_xml}" > /dev/null
-        sudo virsh net-define "${net2_xml}"
-        sudo virsh net-autostart "${NETWORK_2_NAME}"
-        sudo virsh net-start "${NETWORK_2_NAME}"
-        log_success "Network ${NETWORK_2_NAME} created and started"
+    if [ -z "$TARGET_CLUSTER" ] || [ "$TARGET_CLUSTER" == "2" ]; then
+        if sudo virsh net-list --all | grep -q "${NETWORK_2_NAME}"; then
+            log_warn "Network ${NETWORK_2_NAME} already exists, skipping creation"
+        else
+            log_info "Creating network ${NETWORK_2_NAME} (${NETWORK_2_CIDR})"
+            local net2_xml="${CONF_DIR}/${NETWORK_2_NAME}.xml"
+            create_network_xml "${NETWORK_2_NAME}" "${NETWORK_2_GATEWAY}" | sudo tee "${net2_xml}" > /dev/null
+            sudo virsh net-define "${net2_xml}"
+            sudo virsh net-autostart "${NETWORK_2_NAME}"
+            sudo virsh net-start "${NETWORK_2_NAME}"
+            log_success "Network ${NETWORK_2_NAME} created and started"
+        fi
     fi
 }
 
@@ -247,28 +289,31 @@ delete_networks() {
     log_info "Deleting libvirt networks..."
     
     # Network 1
-    if sudo virsh net-list --all | grep -q "${NETWORK_1_NAME}"; then
-        log_info "Stopping and deleting network ${NETWORK_1_NAME}"
-        sudo virsh net-destroy "${NETWORK_1_NAME}" 2>/dev/null || true
-        sudo virsh net-undefine "${NETWORK_1_NAME}"
-        log_success "Network ${NETWORK_1_NAME} deleted"
+    if [ -z "$TARGET_CLUSTER" ] || [ "$TARGET_CLUSTER" == "1" ]; then
+        if sudo virsh net-list --all | grep -q "${NETWORK_1_NAME}"; then
+            log_info "Stopping and deleting network ${NETWORK_1_NAME}"
+            sudo virsh net-destroy "${NETWORK_1_NAME}" 2>/dev/null || true
+            sudo virsh net-undefine "${NETWORK_1_NAME}"
+            log_success "Network ${NETWORK_1_NAME} deleted"
+        fi
     fi
     
     # Network 2
-    if sudo virsh net-list --all | grep -q "${NETWORK_2_NAME}"; then
-        log_info "Stopping and deleting network ${NETWORK_2_NAME}"
-        sudo virsh net-destroy "${NETWORK_2_NAME}" 2>/dev/null || true
-        sudo virsh net-undefine "${NETWORK_2_NAME}"
-        log_success "Network ${NETWORK_2_NAME} deleted"
+    if [ -z "$TARGET_CLUSTER" ] || [ "$TARGET_CLUSTER" == "2" ]; then
+        if sudo virsh net-list --all | grep -q "${NETWORK_2_NAME}"; then
+            log_info "Stopping and deleting network ${NETWORK_2_NAME}"
+            sudo virsh net-destroy "${NETWORK_2_NAME}" 2>/dev/null || true
+            sudo virsh net-undefine "${NETWORK_2_NAME}"
+            log_success "Network ${NETWORK_2_NAME} deleted"
+        fi
     fi
     
-    # Cleanup network XML files
     sudo rm -f "${CONF_DIR}/${NETWORK_1_NAME}.xml"
     sudo rm -f "${CONF_DIR}/${NETWORK_2_NAME}.xml"
 }
 
 # =============================================================================
-# BUTANE/IGNITION CONFIGURATION GENERATION
+# BUTANE/IGNITION CONFIGURATION
 # =============================================================================
 
 generate_butane_config() {
@@ -276,7 +321,6 @@ generate_butane_config() {
     local ip_address=$2
     local gateway=$3
     local dns=$4
-    local interface=$5
     
     cat <<EOF
 variant: fcos
@@ -293,14 +337,14 @@ passwd:
         - ${SSH_KEY}
 storage:
   files:
-    - path: /etc/NetworkManager/system-connections/${interface}.nmconnection
+    - path: /etc/NetworkManager/system-connections/${NETWORK_INTERFACE}.nmconnection
       mode: 0600
       contents:
         inline: |
           [connection]
-          id=${interface}
+          id=${NETWORK_INTERFACE}
           type=ethernet
-          interface-name=${interface}
+          interface-name=${NETWORK_INTERFACE}
           
           [ipv4]
           address1=${ip_address}/24,${gateway}
@@ -348,32 +392,28 @@ create_vm() {
     local ip_address=$3
     local gateway=$4
     local dns=$5
-    local vm_index=$6
-    local network_index=$7
+    local cluster_id=$6
+    local vm_index=$7
     
-    log_info "Creating VM ${vm_name} on network ${network_name} with IP ${ip_address}"
+    log_info "[Cluster $cluster_id] Creating VM ${vm_name} (${ip_address})"
     
-    # Paths for configs
     local butane_config="${CONF_DIR}/${vm_name}.bu"
     local ignition_config="${CONF_DIR}/${vm_name}.ign"
     local extra_disk_path="${LIBVIRT_IMAGES_DIR}/${vm_name}-extra.qcow2"
     
-    # Generate Butane config
-    generate_butane_config "${vm_name}" "${ip_address}" "${gateway}" "${dns}" "${NETWORK_INTERFACE}" | sudo tee "${butane_config}" > /dev/null
+    # Generate configs
+    generate_butane_config "${vm_name}" "${ip_address}" "${gateway}" "${dns}" | sudo tee "${butane_config}" > /dev/null
     sudo chown libvirt-qemu:libvirt-qemu "${butane_config}"
     sudo chmod 644 "${butane_config}"
     
-    # Convert Butane to Ignition
-    log_info "Generating Ignition config for ${vm_name}"
     sudo podman run --interactive --rm quay.io/coreos/butane:release --pretty --strict < "${butane_config}" | sudo tee "${ignition_config}" > /dev/null
     sudo chown libvirt-qemu:libvirt-qemu "${ignition_config}"
     sudo chmod 644 "${ignition_config}"
     
     # Create extra disk
-    log_info "Creating extra disk (${VM_EXTRA_DISK_GB}GB) for ${vm_name}"
     sudo qemu-img create -f qcow2 "${extra_disk_path}" "${VM_EXTRA_DISK_GB}G"
     
-    # Create VM with virt-install
+    # Create VM
     local ignition_device_arg="--qemu-commandline=-fw_cfg name=opt/com.coreos/config,file=${ignition_config}"
     
     sudo virt-install \
@@ -388,121 +428,167 @@ create_vm() {
         --disk="size=${VM_MAIN_DISK_GB},backing_store=${FCOS_IMAGE}" \
         --disk="path=${extra_disk_path},format=qcow2" \
         --network network="${network_name}" \
-        "${ignition_device_arg}"
+        "${ignition_device_arg}" &> /dev/null
     
-    # Get disk path for state file
     local main_disk_path
     main_disk_path=$(sudo virsh domblklist "${vm_name}" --details | grep "vda\|sda\|hda" | awk '{print $4}' || echo "")
     
-    # Save VM info to state lock file
-    echo "VM_NAME=${vm_name}|MAIN_DISK=${main_disk_path}|EXTRA_DISK=${extra_disk_path}|IP=${ip_address}|NETWORK=${network_name}|NETWORK_INDEX=${network_index}|VM_INDEX=${vm_index}" | sudo tee -a "${STATE_LOCK_FILE}" > /dev/null
+    echo "VM_NAME=${vm_name}|MAIN_DISK=${main_disk_path}|EXTRA_DISK=${extra_disk_path}|IP=${ip_address}|CLUSTER=${cluster_id}|VM_INDEX=${vm_index}" | sudo tee -a "${STATE_FILE}" > /dev/null
     
-    log_success "Created ${vm_name} with IP ${ip_address}"
+    log_success "[Cluster $cluster_id] Created ${vm_name}"
+}
+
+create_cluster_vms() {
+    local cluster_id=$1
+    local prefix=$2
+    local network=$3
+    local gateway=$4
+    local dns=$5
+    local ip_base=$6
+    local state_file=$7
+    
+    export STATE_FILE="$state_file"
+    
+    # Initialize state file
+    echo "# Cluster ${cluster_id} State File" | sudo tee "${state_file}" > /dev/null
+    echo "# Created: $(date)" | sudo tee -a "${state_file}" > /dev/null
+    echo "" | sudo tee -a "${state_file}" > /dev/null
+    
+    for i in $(seq 1 ${VMS_PER_CLUSTER}); do
+        local vm_name="${prefix}-n${i}"
+        local ip_offset=$((IP_START + i - 1))
+        local ip_address="${ip_base}.${ip_offset}"
+        
+        create_vm "${vm_name}" "${network}" "${ip_address}" "${gateway}" "${dns}" "$cluster_id" "$i"
+    done
+    
+    log_success "[Cluster $cluster_id] All VMs created"
 }
 
 create_cluster() {
-    log_info "Starting Kubernetes cluster creation..."
-    log_info "Topology: 2 networks × ${VMS_PER_NETWORK} VMs = $((2 * VMS_PER_NETWORK)) VMs total"
-    log_info "Each VM: ${VM_VCPUS} vCPUs, ${VM_RAM_MB}MB RAM, ${VM_MAIN_DISK_GB}GB + ${VM_EXTRA_DISK_GB}GB disks"
+    log_info "Starting multi-cluster creation..."
+    log_info "Target: ${TARGET_CLUSTER:-both clusters}"
     
-    # Install dependencies
     install_dependencies
-    
-    # Apply AppArmor fix
     fix_apparmor
     
-    # Check if FCOS image exists
     if [ ! -f "${FCOS_IMAGE}" ]; then
         log_error "Fedora CoreOS image not found at ${FCOS_IMAGE}"
-        log_info "Please download the image first:"
-        log_info "  wget -P ${LIBVIRT_IMAGES_DIR} https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/43.20260217.3.1/x86_64/${FCOS_IMAGE_NAME}"
+        log_info "Please download: wget -P ${LIBVIRT_IMAGES_DIR} https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/43.20260217.3.1/x86_64/${FCOS_IMAGE_NAME}"
         exit 1
     fi
     
-    # Create networks
     create_networks
     
-    # Initialize state lock file
-    echo "# Kubernetes Cluster State Lock File" | sudo tee "${STATE_LOCK_FILE}" > /dev/null
-    echo "# Created: $(date)" | sudo tee -a "${STATE_LOCK_FILE}" > /dev/null
-    echo "# Topology: 2 networks × ${VMS_PER_NETWORK} VMs (control plane + worker)" | sudo tee -a "${STATE_LOCK_FILE}" > /dev/null
-    echo "" | sudo tee -a "${STATE_LOCK_FILE}" > /dev/null
-    
-    # Create VMs for Network 1
-    log_info "Creating VMs for Network 1 (${NETWORK_1_NAME})..."
-    for i in $(seq 1 ${VMS_PER_NETWORK}); do
-        local vm_name="${VM_NAME_PREFIX}-n1-${i}"
-        local ip_offset=$((IP_START + i - 1))
-        local ip_address="${NETWORK_1_IP_BASE}.${ip_offset}"
+    # Create clusters in parallel
+    if [ -z "$TARGET_CLUSTER" ]; then
+        log_info "Creating both clusters in parallel..."
+        create_cluster_vms 1 "${CLUSTER_1_PREFIX}" "${CLUSTER_1_NETWORK}" "${CLUSTER_1_GATEWAY}" "${CLUSTER_1_DNS}" "${CLUSTER_1_IP_BASE}" "${CLUSTER_1_STATE}" &
+        local pid1=$!
         
-        create_vm "${vm_name}" "${NETWORK_1_NAME}" "${ip_address}" "${NETWORK_1_GATEWAY}" "${NETWORK_1_DNS}" "$i" "1"
-    done
-    
-    # Create VMs for Network 2
-    log_info "Creating VMs for Network 2 (${NETWORK_2_NAME})..."
-    for i in $(seq 1 ${VMS_PER_NETWORK}); do
-        local vm_name="${VM_NAME_PREFIX}-n2-${i}"
-        local ip_offset=$((IP_START + i - 1))
-        local ip_address="${NETWORK_2_IP_BASE}.${ip_offset}"
+        create_cluster_vms 2 "${CLUSTER_2_PREFIX}" "${CLUSTER_2_NETWORK}" "${CLUSTER_2_GATEWAY}" "${CLUSTER_2_DNS}" "${CLUSTER_2_IP_BASE}" "${CLUSTER_2_STATE}" &
+        local pid2=$!
         
-        create_vm "${vm_name}" "${NETWORK_2_NAME}" "${ip_address}" "${NETWORK_2_GATEWAY}" "${NETWORK_2_DNS}" "$i" "2"
-    done
+        wait $pid1 || log_error "Cluster 1 creation failed"
+        wait $pid2 || log_error "Cluster 2 creation failed"
+        
+    elif [ "$TARGET_CLUSTER" == "1" ]; then
+        create_cluster_vms 1 "${CLUSTER_1_PREFIX}" "${CLUSTER_1_NETWORK}" "${CLUSTER_1_GATEWAY}" "${CLUSTER_1_DNS}" "${CLUSTER_1_IP_BASE}" "${CLUSTER_1_STATE}"
+    elif [ "$TARGET_CLUSTER" == "2" ]; then
+        create_cluster_vms 2 "${CLUSTER_2_PREFIX}" "${CLUSTER_2_NETWORK}" "${CLUSTER_2_GATEWAY}" "${CLUSTER_2_DNS}" "${CLUSTER_2_IP_BASE}" "${CLUSTER_2_STATE}"
+    fi
     
     echo ""
-    log_success "All VMs created successfully!"
+    log_success "Cluster creation completed!"
     echo ""
     echo "=========================================="
-    echo "Cluster Summary:"
+    echo "Cluster 1 (${CLUSTER_1_NAME}): ${NETWORK_1_CIDR}"
+    for i in $(seq 1 ${VMS_PER_CLUSTER}); do
+        echo "  - ${CLUSTER_1_PREFIX}-n${i}: ${CLUSTER_1_IP_BASE}.$((IP_START + i - 1))"
+    done
+    echo ""
+    echo "Cluster 2 (${CLUSTER_2_NAME}): ${NETWORK_2_CIDR}"
+    for i in $(seq 1 ${VMS_PER_CLUSTER}); do
+        echo "  - ${CLUSTER_2_PREFIX}-n${i}: ${CLUSTER_2_IP_BASE}.$((IP_START + i - 1))"
+    done
     echo "=========================================="
-    echo "Network 1 (${NETWORK_1_NAME}): ${NETWORK_1_CIDR}"
-    for i in $(seq 1 ${VMS_PER_NETWORK}); do
-        local ip="${NETWORK_1_IP_BASE}.$((IP_START + i - 1))"
-        echo "  - ${VM_NAME_PREFIX}-n1-${i}: ${ip} (Control Plane + Worker)"
-    done
-    echo ""
-    echo "Network 2 (${NETWORK_2_NAME}): ${NETWORK_2_CIDR}"
-    for i in $(seq 1 ${VMS_PER_NETWORK}); do
-        local ip="${NETWORK_2_IP_BASE}.$((IP_START + i - 1))"
-        echo "  - ${VM_NAME_PREFIX}-n2-${i}: ${ip} (Control Plane + Worker)"
-    done
-    echo ""
-    echo "VM Specifications:"
-    echo "  - RAM: ${VM_RAM_MB}MB (${VM_RAM_MB} / 1024 GB)"
-    echo "  - vCPUs: ${VM_VCPUS}"
-    echo "  - Main Disk: ${VM_MAIN_DISK_GB}GB"
-    echo "  - Extra Disk: ${VM_EXTRA_DISK_GB}GB"
-    echo ""
-    echo "State file saved to: ${STATE_LOCK_FILE}"
-    echo ""
-    echo "NOTE: Python3 installation will happen automatically on first boot."
-    echo "This may take 2-3 minutes per node."
     echo ""
     
-    # Test SSH connectivity
-    test_ssh_connectivity
+    # Test SSH
+    test_ssh_clusters
 }
 
 # =============================================================================
-# SSH CONNECTIVITY TEST
+# SSH TESTING
 # =============================================================================
 
-test_ssh_connectivity() {
+test_ssh_clusters() {
     echo ""
     echo "=========================================="
-    echo "Testing SSH connectivity to ALL nodes..."
+    echo "Testing SSH connectivity..."
     echo "=========================================="
     echo ""
     
-    declare -a vm_ips
-    declare -a vm_names
+    local all_success=true
+    local failed_nodes=()
     
-    # Collect all VM information
+    if [ -z "$TARGET_CLUSTER" ] || [ "$TARGET_CLUSTER" == "1" ]; then
+        log_info "Testing Cluster 1..."
+        for i in $(seq 1 ${VMS_PER_CLUSTER}); do
+            local ip="${CLUSTER_1_IP_BASE}.$((IP_START + i - 1))"
+            if ! wait_for_ssh "$ip"; then
+                all_success=false
+                failed_nodes+=("Cluster 1 - ${CLUSTER_1_PREFIX}-n${i} ($ip)")
+            fi
+        done
+    fi
+    
+    if [ -z "$TARGET_CLUSTER" ] || [ "$TARGET_CLUSTER" == "2" ]; then
+        log_info "Testing Cluster 2..."
+        for i in $(seq 1 ${VMS_PER_CLUSTER}); do
+            local ip="${CLUSTER_2_IP_BASE}.$((IP_START + i - 1))"
+            if ! wait_for_ssh "$ip"; then
+                all_success=false
+                failed_nodes+=("Cluster 2 - ${CLUSTER_2_PREFIX}-n${i} ($ip)")
+            fi
+        done
+    fi
+    
+    if [ "$all_success" = true ]; then
+        log_success "All nodes are accessible via SSH"
+        echo ""
+        log_success "Clusters are ready for deployment!"
+        echo "Run: $SCRIPT_NAME deploy${TARGET_CLUSTER:+ --cluster $TARGET_CLUSTER}"
+    else
+        log_error "SSH test failed for:"
+        for node in "${failed_nodes[@]}"; do
+            echo "  - ${node}"
+        done
+        exit 1
+    fi
+}
+
+# =============================================================================
+# KUBESPRAY DEPLOYMENT
+# =============================================================================
+
+generate_inventory() {
+    local cluster_id=$1
+    local prefix=$2
+    local inventory_file=$3
+    local state_file=$4
+    local inventory_dir=$(dirname "$inventory_file")
+    
+    # Create inventory directory
+    mkdir -p "$inventory_dir"
+    
+    # Parse nodes from state file
+    declare -a nodes
     while IFS= read -r vm_line; do
         [[ "$vm_line" =~ ^#.*$ ]] && continue
         [[ -z "$vm_line" ]] && continue
         
         IFS='|' read -ra FIELDS <<< "$vm_line"
-        
         local vm_name=""
         local vm_ip=""
         
@@ -514,132 +600,27 @@ test_ssh_connectivity() {
         done
         
         if [[ -n "$vm_name" && -n "$vm_ip" ]]; then
-            vm_names+=("$vm_name")
-            vm_ips+=("$vm_ip")
+            nodes+=("${vm_name}|${vm_ip}")
         fi
-    done < <(sudo cat "${STATE_LOCK_FILE}")
+    done < <(sudo cat "$state_file")
     
-    local total_nodes=${#vm_names[@]}
-    log_info "Found ${total_nodes} nodes to test"
-    echo ""
-    
-    local all_ssh_success=true
-    declare -a failed_nodes
-    
-    for i in "${!vm_names[@]}"; do
-        local node_num=$((i + 1))
-        echo "[${node_num}/${total_nodes}] Testing ${vm_names[$i]} (${vm_ips[$i]})"
-        
-        if ! wait_for_ssh "${vm_ips[$i]}"; then
-            all_ssh_success=false
-            failed_nodes+=("${vm_names[$i]} (${vm_ips[$i]})")
-        fi
-        echo ""
-    done
-    
-    echo "=========================================="
-    
-    if [ "$all_ssh_success" = true ]; then
-        log_success "All ${total_nodes} nodes are accessible via SSH as ${SSH_USER}"
-        echo "=========================================="
-        echo ""
-        log_success "Cluster is ready for Kubespray deployment!"
-        echo "Run: $SCRIPT_NAME deploy"
-        exit 0
-    else
-        log_error "SSH connectivity test FAILED for the following nodes:"
-        echo ""
-        for failed_node in "${failed_nodes[@]}"; do
-            echo "  - ${failed_node}"
-        done
-        echo ""
-        echo "Total: ${#failed_nodes[@]} out of ${total_nodes} nodes failed"
-        echo "=========================================="
-        exit 1
-    fi
-}
-
-# =============================================================================
-# KUBESPRAY DEPLOYMENT
-# =============================================================================
-
-deploy_kubespray() {
-    echo "=========================================="
-    echo "Deploying Kubernetes with Kubespray"
-    echo "=========================================="
-    echo ""
-    
-    # Check prerequisites
-    if [ ! -f "${STATE_LOCK_FILE}" ]; then
-        log_error "State lock file not found at ${STATE_LOCK_FILE}"
-        log_info "Please run '$SCRIPT_NAME create' first to create the cluster VMs."
-        exit 1
-    fi
-    
-    if [ ! -d "${KUBESPRAY_DIR}" ]; then
-        log_error "Kubespray directory not found at ${KUBESPRAY_DIR}"
-        log_info "Please clone kubespray repository first."
-        exit 1
-    fi
-
-    if [ ! -d "${INVENTORY_DIR}" ]; then
-        log_error "Kubespray cluster directory not found at ${INVENTORY_DIR}"
-        log_info "Please create the folder or copy inventory/sample/ first."
-        exit 1
-    fi
-    
-    log_info "Step 1: Generating Ansible inventory from state lock file..."
-    echo ""
-    
-    # Parse all nodes from state file
-    declare -a all_nodes
-    
-    while IFS= read -r vm_line; do
-        [[ "$vm_line" =~ ^#.*$ ]] && continue
-        [[ -z "$vm_line" ]] && continue
-        
-        IFS='|' read -ra FIELDS <<< "$vm_line"
-        
-        local vm_name=""
-        local vm_ip=""
-        local network_index=""
-        local vm_index=""
-        
-        for field in "${FIELDS[@]}"; do
-            case "$field" in
-                VM_NAME=*) vm_name="${field#VM_NAME=}" ;;
-                IP=*) vm_ip="${field#IP=}" ;;
-                NETWORK_INDEX=*) network_index="${field#NETWORK_INDEX=}" ;;
-                VM_INDEX=*) vm_index="${field#VM_INDEX=}" ;;
-            esac
-        done
-        
-        if [[ -n "$vm_name" && -n "$vm_ip" && -n "$network_index" && -n "$vm_index" ]]; then
-            all_nodes+=("${vm_name}|${vm_ip}|${network_index}|${vm_index}")
-        fi
-    done < <(sudo cat "${STATE_LOCK_FILE}")
-    
-    # Generate inventory file
-    # All nodes are both control plane and workers (combined topology)
-    cat > "${INVENTORY_FILE}" <<EOF
-# Kubernetes Cluster Inventory
-# Topology: 2 networks × ${VMS_PER_NETWORK} nodes (combined control plane + worker)
+    # Generate inventory
+    cat > "$inventory_file" <<EOF
+# Kubernetes Cluster ${cluster_id} Inventory
 # Generated: $(date)
 
 [kube_control_plane]
 EOF
 
-    # Add all nodes as control planes with etcd member names
     local etcd_counter=1
-    for node_info in "${all_nodes[@]}"; do
+    for node_info in "${nodes[@]}"; do
         local node_name=$(echo "$node_info" | cut -d'|' -f1)
         local node_ip=$(echo "$node_info" | cut -d'|' -f2)
-        echo "${node_name} ansible_host=${node_ip} ansible_user=${SSH_USER} etcd_member_name=etcd${etcd_counter}" >> "${INVENTORY_FILE}"
+        echo "${node_name} ansible_host=${node_ip} ansible_user=${SSH_USER} etcd_member_name=etcd${etcd_counter}" >> "$inventory_file"
         etcd_counter=$((etcd_counter + 1))
     done
     
-    # Add etcd section (same as control plane)
-    cat >> "${INVENTORY_FILE}" <<EOF
+    cat >> "$inventory_file" <<EOF
 
 [etcd:children]
 kube_control_plane
@@ -647,195 +628,184 @@ kube_control_plane
 [kube_node]
 EOF
 
-    # Add all nodes as workers
-    for node_info in "${all_nodes[@]}"; do
+    for node_info in "${nodes[@]}"; do
         local node_name=$(echo "$node_info" | cut -d'|' -f1)
         local node_ip=$(echo "$node_info" | cut -d'|' -f2)
-        echo "${node_name} ansible_host=${node_ip} ansible_user=${SSH_USER}" >> "${INVENTORY_FILE}"
+        echo "${node_name} ansible_host=${node_ip} ansible_user=${SSH_USER}" >> "$inventory_file"
     done
     
-    # Add k8s_cluster group
-    cat >> "${INVENTORY_FILE}" <<EOF
+    cat >> "$inventory_file" <<EOF
 
 [k8s_cluster:children]
 kube_control_plane
 kube_node
 EOF
+
+    log_success "[Cluster $cluster_id] Inventory generated: $inventory_file"
+}
+
+deploy_single_cluster() {
+    local cluster_id=$1
+    local prefix=$2
+    local inventory_file=$3
+    local state_file=$4
+    local inventory_dir=$(dirname "$inventory_file")
     
-    log_success "Inventory file generated at: ${INVENTORY_FILE}"
-    echo ""
-    echo "Inventory contents:"
-    echo "-------------------"
-    cat "${INVENTORY_FILE}"
-    echo "-------------------"
-    echo ""
+    log_info "[Cluster $cluster_id] Starting deployment..."
     
-    # Change to kubespray directory
-    cd "${KUBESPRAY_DIR}" || exit 1
+    if [ ! -f "$state_file" ]; then
+        log_error "[Cluster $cluster_id] State file not found: $state_file"
+        return 1
+    fi
     
-    # Check virtual environment
+    if [ ! -d "${KUBESPRAY_DIR}" ]; then
+        log_error "Kubespray directory not found: ${KUBESPRAY_DIR}"
+        return 1
+    fi
+    
+    # Generate inventory
+    generate_inventory "$cluster_id" "$prefix" "$inventory_file" "$state_file"
+    
+    # Create venv if needed
+    cd "${KUBESPRAY_DIR}" || return 1
+    
     if [ ! -d ".venv" ]; then
-        log_error "Python virtual environment not found at ${KUBESPRAY_DIR}/.venv"
-        log_info "Please set up kubespray first (pip install -r requirements.txt)"
-        exit 1
+        log_error "[Cluster $cluster_id] Python virtual environment not found"
+        return 1
     fi
     
-    log_info "Step 2: Activating Python virtual environment..."
     source .venv/bin/activate
-    log_success "Virtual environment activated"
-    echo ""
     
-    log_info "Step 3: Verifying Python installation on all nodes..."
-    echo ""
+    # Test Ansible connectivity
+    log_info "[Cluster $cluster_id] Testing Ansible connectivity..."
+    if ! ansible -i "$inventory_file" -m ping all; then
+        log_error "[Cluster $cluster_id] Ansible connectivity test failed"
+        deactivate
+        return 1
+    fi
     
-    # Verify Python is installed
-    local python_check_failed=false
-    for node_info in "${all_nodes[@]}"; do
-        local node_ip=$(echo "$node_info" | cut -d'|' -f2)
-        echo -n "Checking Python on ${node_ip}... "
-        if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ${SSH_USER}@${node_ip} "which python3" &> /dev/null; then
-            echo "✓"
+    # Deploy
+    log_info "[Cluster $cluster_id] Deploying Kubernetes..."
+    if ansible-playbook -i "$inventory_file" cluster.yml -b -v --private-key="${SSH_PRIVATE_KEY}"; then
+        log_success "[Cluster $cluster_id] Kubernetes deployed successfully!"
+        local first_ip=$(grep "ansible_host" "$inventory_file" | head -1 | sed 's/.*ansible_host=\([^ ]*\).*/\1/')
+        echo ""
+        log_info "[Cluster $cluster_id] To access:"
+        echo "  ssh ${SSH_USER}@${first_ip}"
+        echo "  mkdir ~/.kube && sudo cp /etc/kubernetes/admin.conf ~/.kube/config"
+        deactivate
+        return 0
+    else
+        log_error "[Cluster $cluster_id] Deployment failed"
+        deactivate
+        return 1
+    fi
+}
+
+deploy_clusters() {
+    log_info "Starting Kubernetes deployment..."
+    log_info "Target: ${TARGET_CLUSTER:-both clusters}"
+    
+    if [ -z "$TARGET_CLUSTER" ]; then
+        log_info "Deploying both clusters in parallel..."
+        deploy_single_cluster 1 "${CLUSTER_1_PREFIX}" "${CLUSTER_1_INVENTORY}" "${CLUSTER_1_STATE}" &
+        local pid1=$!
+        
+        deploy_single_cluster 2 "${CLUSTER_2_PREFIX}" "${CLUSTER_2_INVENTORY}" "${CLUSTER_2_STATE}" &
+        local pid2=$!
+        
+        wait $pid1
+        local status1=$?
+        wait $pid2
+        local status2=$?
+        
+        if [ $status1 -eq 0 ] && [ $status2 -eq 0 ]; then
+            log_success "Both clusters deployed successfully!"
         else
-            echo "✗ Python not found"
-            python_check_failed=true
+            [ $status1 -ne 0 ] && log_error "Cluster 1 deployment failed"
+            [ $status2 -ne 0 ] && log_error "Cluster 2 deployment failed"
+            exit 1
         fi
-    done
-    echo ""
-    
-    if [ "$python_check_failed" = true ]; then
-        log_error "Python is not installed on some nodes"
-        log_info "Please wait a few more minutes for rpm-ostree to complete, then try again"
-        deactivate
-        exit 1
+        
+    elif [ "$TARGET_CLUSTER" == "1" ]; then
+        deploy_single_cluster 1 "${CLUSTER_1_PREFIX}" "${CLUSTER_1_INVENTORY}" "${CLUSTER_1_STATE}"
+        
+    elif [ "$TARGET_CLUSTER" == "2" ]; then
+        deploy_single_cluster 2 "${CLUSTER_2_PREFIX}" "${CLUSTER_2_INVENTORY}" "${CLUSTER_2_STATE}"
     fi
-    
-    log_info "Step 4: Testing Ansible connectivity to all nodes..."
-    echo ""
-    
-    if ansible -i "${INVENTORY_FILE}" -m ping all; then
-        echo ""
-        log_success "All nodes are reachable via Ansible"
-        echo ""
-    else
-        echo ""
-        log_error "Ansible connectivity test failed"
-        log_info "Please check your SSH keys and network configuration"
-        deactivate
-        exit 1
-    fi
-    
-    log_info "Step 5: Deploying Kubernetes cluster with Kubespray..."
-    log_info "This may take 15-30 minutes depending on your system..."
-    echo ""
-    
-    if ansible-playbook -i "${INVENTORY_FILE}" cluster.yml \
-        -b -v --private-key="${SSH_PRIVATE_KEY}"; then
-        echo ""
-        echo "=========================================="
-        log_success "Kubernetes cluster deployed successfully!"
-        echo "=========================================="
-        echo ""
-        log_info "To access your cluster:"
-        local first_node_ip=$(echo "${all_nodes[0]}" | cut -d'|' -f2)
-        echo "1. SSH to a control plane node: ssh ${SSH_USER}@${first_node_ip}"
-        echo "2. Create .kube folder: mkdir ~/.kube"
-        echo "3. Copy kubeconfig: sudo cp /etc/kubernetes/admin.conf ~/.kube/config"
-        echo "4. Set permissions: sudo chown ${SSH_USER}:${SSH_USER} ~/.kube/config"
-        echo "5. Run: kubectl get nodes"
-        echo ""
-    else
-        echo ""
-        log_error "Kubernetes deployment failed"
-        log_info "Check the Ansible output above for errors"
-        deactivate
-        exit 1
-    fi
-    
-    deactivate
 }
 
 # =============================================================================
 # CLUSTER DELETION
 # =============================================================================
 
-delete_cluster() {
-    if [ ! -f "${STATE_LOCK_FILE}" ]; then
-        log_error "State lock file not found at ${STATE_LOCK_FILE}"
-        log_info "No cluster to delete or file has been moved."
-        exit 1
-    fi
-
-    log_info "Reading cluster state from ${STATE_LOCK_FILE}"
-    echo ""
+delete_single_cluster() {
+    local cluster_id=$1
+    local state_file=$2
+    local inventory_file=$3
     
-    # Read and delete each VM
-    while IFS='|' read -r vm_entry; do
-        [[ "$vm_entry" =~ ^#.*$ ]] && continue
-        [[ -z "$vm_entry" ]] && continue
-        
-        local vm_name=""
-        local main_disk=""
-        local extra_disk=""
-        
-        IFS='|' read -ra FIELDS <<< "$vm_entry"
-        for field in "${FIELDS[@]}"; do
-            case "$field" in
-                VM_NAME=*) vm_name="${field#VM_NAME=}" ;;
-                MAIN_DISK=*) main_disk="${field#MAIN_DISK=}" ;;
-                EXTRA_DISK=*) extra_disk="${field#EXTRA_DISK=}" ;;
-            esac
-        done
-        
-        if [ -z "$vm_name" ]; then
-            continue
-        fi
-        
-        log_info "Deleting VM: ${vm_name}"
-        
-        # Check if VM exists
-        if sudo virsh list --all | grep -q "${vm_name}"; then
-            # Stop VM if running
-            if sudo virsh list --state-running | grep -q "${vm_name}"; then
-                log_info "  Stopping ${vm_name}..."
-                sudo virsh destroy "${vm_name}" 2>/dev/null || true
+    log_info "[Cluster $cluster_id] Deleting VMs..."
+    
+    # Delete VMs from state file
+    if [ -f "$state_file" ]; then
+        while IFS='|' read -r vm_entry; do
+            [[ "$vm_entry" =~ ^#.*$ ]] && continue
+            [[ -z "$vm_entry" ]] && continue
+            
+            local vm_name=""
+            local extra_disk=""
+            
+            IFS='|' read -ra FIELDS <<< "$vm_entry"
+            for field in "${FIELDS[@]}"; do
+                case "$field" in
+                    VM_NAME=*) vm_name="${field#VM_NAME=}" ;;
+                    EXTRA_DISK=*) extra_disk="${field#EXTRA_DISK=}" ;;
+                esac
+            done
+            
+            if [ -n "$vm_name" ]; then
+                if sudo virsh list --all | grep -q "${vm_name}"; then
+                    log_info "[Cluster $cluster_id] Deleting VM ${vm_name}"
+                    sudo virsh destroy "${vm_name}" 2>/dev/null || true
+                    sudo virsh undefine "${vm_name}" --remove-all-storage 2>/dev/null || true
+                    
+                    # Clean up extra disk if still exists
+                    if [ -n "${extra_disk}" ] && sudo [ -f "${extra_disk}" ]; then
+                        sudo rm -f "${extra_disk}"
+                    fi
+                fi
+                
+                # Clean up config files
+                sudo rm -f "${CONF_DIR}/${vm_name}.bu"
+                sudo rm -f "${CONF_DIR}/${vm_name}.ign"
             fi
-            
-            # Undefine VM and remove storage
-            log_info "  Removing VM definition and storage..."
-            sudo virsh undefine "${vm_name}" --remove-all-storage 2>/dev/null || true
-            
-            log_success "  ${vm_name} deleted"
-        else
-            log_warn "  ${vm_name} not found (may have been manually deleted)"
-        fi
+        done < <(sudo cat "$state_file")
         
-        # Remove extra disk if it still exists
-        if [ -n "${extra_disk}" ] && sudo [ -f "${extra_disk}" ]; then
-            log_info "  Removing extra disk: ${extra_disk}"
-            sudo rm -f "${extra_disk}"
-        fi
-        
-        # Remove config files
-        local butane_config="${CONF_DIR}/${vm_name}.bu"
-        local ignition_config="${CONF_DIR}/${vm_name}.ign"
-        sudo rm -f "${butane_config}" "${ignition_config}"
-        
-        echo ""
-        
-    done < <(sudo cat "${STATE_LOCK_FILE}")
-    
-    # Delete networks
-    delete_networks
-    
-    # Remove state lock file
-    log_info "Removing state lock file..."
-    sudo rm -f "${STATE_LOCK_FILE}"
-    
-    # Remove inventory file if it exists
-    if [ -f "${INVENTORY_FILE}" ]; then
-        log_info "Removing Ansible inventory file..."
-        rm -f "${INVENTORY_FILE}"
+        # Remove state file
+        sudo rm -f "$state_file"
     fi
+    
+    # Remove inventory
+    rm -f "$inventory_file"
+    
+    log_success "[Cluster $cluster_id] Deleted"
+}
+
+delete_cluster() {
+    log_info "Starting cluster deletion..."
+    log_info "Target: ${TARGET_CLUSTER:-both clusters}"
+    
+    # STEP 1: Delete VMs first (before networks!)
+    if [ -z "$TARGET_CLUSTER" ] || [ "$TARGET_CLUSTER" == "1" ]; then
+        delete_single_cluster 1 "${CLUSTER_1_STATE}" "${CLUSTER_1_INVENTORY}"
+    fi
+    
+    if [ -z "$TARGET_CLUSTER" ] || [ "$TARGET_CLUSTER" == "2" ]; then
+        delete_single_cluster 2 "${CLUSTER_2_STATE}" "${CLUSTER_2_INVENTORY}"
+    fi
+    
+    # STEP 2: Delete networks (only after all VMs are gone)
+    delete_networks
     
     log_success "Cluster deletion completed!"
 }
@@ -844,11 +814,7 @@ delete_cluster() {
 # MAIN EXECUTION
 # =============================================================================
 
-if [ $# -eq 0 ]; then
-    usage
-fi
-
-MODE=$1
+parse_args "$@"
 
 case "$MODE" in
     create)
@@ -858,7 +824,7 @@ case "$MODE" in
         delete_cluster
         ;;
     deploy)
-        deploy_kubespray
+        deploy_clusters
         ;;
     *)
         log_error "Invalid mode '$MODE'"
