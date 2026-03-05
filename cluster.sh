@@ -109,6 +109,85 @@ wait_for_ssh() {
 }
 
 # =============================================================================
+# DEPENDENCIES INSTALLATION
+# =============================================================================
+
+install_dependencies() {
+    log_info "Checking and installing dependencies..."
+    
+    # Update package list
+    sudo apt-get update
+    
+    # Install required packages
+    local packages="git libvirt-daemon libvirt-clients sudo podman virt-install qemu-utils"
+    
+    for pkg in $packages; do
+        if dpkg -l | grep -q "^ii  $pkg "; then
+            log_success "$pkg is already installed"
+        else
+            log_info "Installing $pkg..."
+            sudo apt-get install -y "$pkg"
+        fi
+    done
+    
+    # Enable and start libvirtd service
+    log_info "Enabling libvirtd service..."
+    sudo systemctl enable libvirtd
+    sudo systemctl start libvirtd
+    
+    log_success "All dependencies installed"
+}
+
+# =============================================================================
+# APPARMOR FIX
+# =============================================================================
+
+fix_apparmor() {
+    log_info "Applying AppArmor fix for libvirt..."
+    
+    local apparmor_file="/etc/apparmor.d/abstractions/libvirt-qemu"
+    
+    # Check if AppArmor is enabled
+    if ! command -v aa-status &> /dev/null; then
+        log_warn "AppArmor not found, skipping fix"
+        return 0
+    fi
+    
+    # Check if the rules already exist
+    if grep -q "/var/lib/libvirt/conf/" "$apparmor_file" 2>/dev/null; then
+        log_info "AppArmor rules already applied"
+        return 0
+    fi
+    
+    # Add AppArmor rules to allow access to conf directory
+    log_info "Adding AppArmor rules for /var/lib/libvirt/conf/"
+    
+    # Backup original file
+    sudo cp "$apparmor_file" "${apparmor_file}.backup.$(date +%Y%m%d%H%M%S)"
+    
+    # Add rules at the end of the file (before the closing brace if present)
+    if grep -q "^}$" "$apparmor_file"; then
+        # File ends with }, insert before the closing brace
+        sudo sed -i '/^}$/i\  /var/lib/libvirt/conf/ r,\n  /var/lib/libvirt/conf/** r,' "$apparmor_file"
+    else
+        # Append to file
+        echo "  /var/lib/libvirt/conf/ r," | sudo tee -a "$apparmor_file" > /dev/null
+        echo "  /var/lib/libvirt/conf/** r," | sudo tee -a "$apparmor_file" > /dev/null
+    fi
+    
+    # Reload AppArmor profile
+    log_info "Reloading AppArmor profile..."
+    sudo apparmor_parser -r "$apparmor_file" || {
+        log_error "Failed to reload AppArmor profile"
+        log_info "Restoring backup..."
+        sudo cp "${apparmor_file}.backup."* "$apparmor_file"
+        return 1
+    }
+    
+    log_success "AppArmor fix applied successfully"
+}
+
+# =============================================================================
 # NETWORK MANAGEMENT
 # =============================================================================
 
@@ -326,8 +405,14 @@ create_cluster() {
     log_info "Topology: 2 networks × ${VMS_PER_NETWORK} VMs = $((2 * VMS_PER_NETWORK)) VMs total"
     log_info "Each VM: ${VM_VCPUS} vCPUs, ${VM_RAM_MB}MB RAM, ${VM_MAIN_DISK_GB}GB + ${VM_EXTRA_DISK_GB}GB disks"
     
+    # Install dependencies
+    install_dependencies
+    
+    # Apply AppArmor fix
+    fix_apparmor
+    
     # Check if FCOS image exists
-    if [ ! -f "${FCOS_IMAGE}"; then
+    if [ ! -f "${FCOS_IMAGE}" ]; then
         log_error "Fedora CoreOS image not found at ${FCOS_IMAGE}"
         log_info "Please download the image first:"
         log_info "  wget -P ${LIBVIRT_IMAGES_DIR} https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/43.20260217.3.1/x86_64/${FCOS_IMAGE_NAME}"
