@@ -114,8 +114,7 @@ wait_for_ssh() {
 
 create_network_xml() {
     local name=$1
-    local cidr=$2
-    local gateway=$3
+    local gateway=$2
     
     cat <<EOF
 <network>
@@ -126,6 +125,7 @@ create_network_xml() {
     </nat>
   </forward>
   <bridge name='virbr-${name}' stp='on' delay='0'/>
+  <dns enable='no'/>
   <ip address='${gateway}' netmask='255.255.255.0'/>
 </network>
 EOF
@@ -143,7 +143,7 @@ create_networks() {
     else
         log_info "Creating network ${NETWORK_1_NAME} (${NETWORK_1_CIDR})"
         local net1_xml="${CONF_DIR}/${NETWORK_1_NAME}.xml"
-        create_network_xml "${NETWORK_1_NAME}" "${NETWORK_1_CIDR}" "${NETWORK_1_GATEWAY}" | sudo tee "${net1_xml}" > /dev/null
+        create_network_xml "${NETWORK_1_NAME}" "${NETWORK_1_GATEWAY}" | sudo tee "${net1_xml}" > /dev/null
         sudo virsh net-define "${net1_xml}"
         sudo virsh net-autostart "${NETWORK_1_NAME}"
         sudo virsh net-start "${NETWORK_1_NAME}"
@@ -156,7 +156,7 @@ create_networks() {
     else
         log_info "Creating network ${NETWORK_2_NAME} (${NETWORK_2_CIDR})"
         local net2_xml="${CONF_DIR}/${NETWORK_2_NAME}.xml"
-        create_network_xml "${NETWORK_2_NAME}" "${NETWORK_2_CIDR}" "${NETWORK_2_GATEWAY}" | sudo tee "${net2_xml}" > /dev/null
+        create_network_xml "${NETWORK_2_NAME}" "${NETWORK_2_GATEWAY}" | sudo tee "${net2_xml}" > /dev/null
         sudo virsh net-define "${net2_xml}"
         sudo virsh net-autostart "${NETWORK_2_NAME}"
         sudo virsh net-start "${NETWORK_2_NAME}"
