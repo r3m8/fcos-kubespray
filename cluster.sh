@@ -281,10 +281,12 @@ create_vm() {
     
     # Generate Butane config
     generate_butane_config "${vm_name}" "${ip_address}" "${gateway}" "${dns}" "${NETWORK_INTERFACE}" | sudo tee "${butane_config}" > /dev/null
+    sudo chmod 644 "${butane_config}"
     
     # Convert Butane to Ignition
     log_info "Generating Ignition config for ${vm_name}"
     sudo podman run --interactive --rm quay.io/coreos/butane:release --pretty --strict < "${butane_config}" | sudo tee "${ignition_config}" > /dev/null
+    sudo chmod 644 "${ignition_config}"
     
     # Create extra disk
     log_info "Creating extra disk (${VM_EXTRA_DISK_GB}GB) for ${vm_name}"
