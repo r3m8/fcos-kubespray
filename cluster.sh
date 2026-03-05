@@ -176,7 +176,7 @@ install_dependencies() {
     
     sudo apt-get update
     
-    local packages="git libvirt-daemon libvirt-clients sudo podman virt-install qemu-utils"
+    local packages="git libvirt-daemon libvirt-clients sudo podman virt-install qemu-utils python3.13-venv"
     
     for pkg in $packages; do
         if dpkg -l | grep -q "^ii  $pkg "; then
