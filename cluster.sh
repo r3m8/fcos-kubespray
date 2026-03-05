@@ -126,8 +126,7 @@ create_network_xml() {
     </nat>
   </forward>
   <bridge name='virbr-${name}' stp='on' delay='0'/>
-  <ip address='${gateway}' netmask='255.255.255.0'>
-  </ip>
+  <ip address='${gateway}' netmask='255.255.255.0'/>
 </network>
 EOF
 }
