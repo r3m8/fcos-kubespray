@@ -211,9 +211,9 @@ fix_apparmor() {
     log_info "Adding AppArmor rules for /var/lib/libvirt/conf/"
     sudo cp "$apparmor_file" "${apparmor_file}.backup.$(date +%Y%m%d%H%M%S)"
     
-    if grep -q "^}$" "$apparmor_file"; then
-        sudo sed -i '/^}$/i\  /var/lib/libvirt/conf/ r,' "$apparmor_file"
-        sudo sed -i '/^}$/i\  /var/lib/libvirt/conf/** r,' "$apparmor_file"
+    if grep -q "^[[:space:]]*}$" "$apparmor_file"; then
+        sudo sed -i '/^[[:space:]]*}$/i\  /var/lib/libvirt/conf/ r,' "$apparmor_file"
+        sudo sed -i '/^[[:space:]]*}$/i\  /var/lib/libvirt/conf/** r,' "$apparmor_file"
     else
         echo "  /var/lib/libvirt/conf/ r," | sudo tee -a "$apparmor_file" > /dev/null
         echo "  /var/lib/libvirt/conf/** r," | sudo tee -a "$apparmor_file" > /dev/null
@@ -221,7 +221,11 @@ fix_apparmor() {
     
     sudo apparmor_parser -r "$apparmor_file" || {
         log_error "Failed to reload AppArmor profile"
-        sudo cp "${apparmor_file}.backup."* "$apparmor_file"
+        local backup_file
+        backup_file=$(ls -t "${apparmor_file}.backup."* 2>/dev/null | head -1)
+        if [ -n "$backup_file" ]; then
+            sudo cp "$backup_file" "$apparmor_file"
+        fi
         return 1
     }
     
