@@ -195,31 +195,37 @@ install_dependencies() {
 
 fix_apparmor() {
     log_info "Applying AppArmor fix for libvirt..."
-    
+
     local apparmor_file="/etc/apparmor.d/abstractions/libvirt-qemu"
-    
+
     if ! command -v aa-status &> /dev/null; then
         log_warn "AppArmor not found, skipping fix"
         return 0
     fi
-    
+
     if grep -q "/var/lib/libvirt/conf/" "$apparmor_file" 2>/dev/null; then
         log_info "AppArmor rules already applied"
         return 0
     fi
-    
+
     log_info "Adding AppArmor rules for /var/lib/libvirt/conf/"
     local backup_file="${apparmor_file}.backup.$(date +%Y%m%d%H%M%S)"
     sudo cp "$apparmor_file" "$backup_file"
-    
-    printf "  /var/lib/libvirt/conf/ r,\n  /var/lib/libvirt/conf/** r,\n" | sudo tee -a "$apparmor_file" > /dev/null
-    
+
+    # Insert rules before the include line, not at the end
+    local rules="  /var/lib/libvirt/conf/ r,\n  /var/lib/libvirt/conf/** r,"
+    if grep -q "include if exists <local/abstractions/libvirt-qemu>" "$apparmor_file"; then
+        sudo sed -i "/include if exists <local\/abstractions\/libvirt-qemu>/i ${rules}" "$apparmor_file"
+    else
+        printf "\n%s\n" "$rules" | sudo tee -a "$apparmor_file" > /dev/null
+    fi
+
     sudo apparmor_parser -r "$apparmor_file" || {
         log_error "Failed to reload AppArmor profile"
         sudo cp "$backup_file" "$apparmor_file"
         return 1
     }
-    
+
     log_success "AppArmor fix applied successfully"
 }
 
